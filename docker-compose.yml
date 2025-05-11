@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  code_rag_api:
+    build: .
+    container_name: code_rag_api_service
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app  # Mount app code for live reload during development
+      - ./data:/app/data    # Mount data directory for FAISS index persistence
+      # Consider creating a named volume for `data` for better Docker management
+      # volumes:
+      #  - faiss_data:/app/data
+    env_file:
+      - .env # Load environment variables from .env file
+    depends_on:
+      ollama: # Make sure Ollama starts before the API, if Ollama is in compose
+        condition: service_healthy # Or just service_started if no healthcheck
+    restart: unless-stopped
+    networks:
+      - rag_network
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama_service
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama # Persist Ollama models
+    # healthcheck: # Optional basic healthcheck for Ollama
+    #   test: ["CMD-SHELL", "ollama list || exit 1"]
+    #   interval: 30s
+    #   timeout: 10s
+    #   retries: 3
+    #   start_period: 60s # Give Ollama time to start and download models initially
+    deploy: # If running models that require GPU
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: "all" # or "all"
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - rag_network
+
+volumes:
+  ollama_data:
+  # faiss_data: # If using named volume for FAISS
+
+networks:
+  rag_network:
+    driver: bridge
