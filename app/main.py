@@ -1,4 +1,5 @@
 import logging
+import traceback
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -7,10 +8,10 @@ from litestar.datastructures import State
 from litestar.exceptions import HTTPException
 from litestar.status_codes import HTTP_500_INTERNAL_SERVER_ERROR, HTTP_400_BAD_REQUEST
 
-from app.core.config import settings
 from app.core.logging_config import setup_logging
 from app.core.vector_store import CodeVectorStore
-from app.core.llm_services import OllamaCodeRefiner
+from app.core.llm_services import CRAGLLMServices
+from app.core.config import settings
 from app.services.rag_pipeline import CodeRAGService
 from app.schemas import (
     HealthCheckResponse, CodeInput, CodeInputResponse,
@@ -25,41 +26,44 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: Litestar):
     logger.info(f"Starting up {settings.APP_NAME}...")
-    # Initialize services and add to app state
-    # This ensures they are created once and reused.
+    app.state.vector_store = None
+    app.state.llm_services = None # Changed name
+    app.state.rag_service = None
+
     try:
         vector_store_instance = CodeVectorStore(index_path=settings.FAISS_INDEX_PATH)
         app.state.vector_store = vector_store_instance
         logger.info(f"CodeVectorStore initialized. Path: {settings.FAISS_INDEX_PATH}. Stats: {vector_store_instance.get_stats()}")
     except Exception as e:
         logger.error(f"Failed to initialize CodeVectorStore: {e}", exc_info=True)
-        app.state.vector_store = None # Indicate failure
 
     try:
-        code_refiner_instance = OllamaCodeRefiner(
-            model_name=settings.OLLAMA_CODE_MODEL, base_url=settings.OLLAMA_BASE_URL
-        )
-        app.state.code_refiner = code_refiner_instance
-        logger.info(f"OllamaCodeRefiner initialized with model {settings.OLLAMA_CODE_MODEL}.")
+        # Initialize the combined LLM services class
+        llm_services_instance = CRAGLLMServices(
+             refiner_model_name=settings.OLLAMA_REFINER_MODEL,
+             helper_model_name=settings.OLLAMA_HELPER_MODEL,
+             base_url=settings.OLLAMA_BASE_URL
+             )
+        app.state.llm_services = llm_services_instance
+        logger.info(f"CRAGLLMServices initialized. Refiner: {settings.OLLAMA_REFINER_MODEL}, Helper: {settings.OLLAMA_HELPER_MODEL}")
     except Exception as e:
-        logger.error(f"Failed to initialize OllamaCodeRefiner: {e}", exc_info=True)
-        app.state.code_refiner = None # Indicate failure
+        logger.error(f"Failed to initialize CRAGLLMServices: {e}", exc_info=True)
 
-    if app.state.vector_store and app.state.code_refiner:
-        app.state.rag_service = CodeRAGService(
-            vector_store=app.state.vector_store,
-            code_refiner=app.state.code_refiner
-        )
-        logger.info("CodeRAGService initialized.")
+    # Initialize RAG Service if dependencies are met
+    if app.state.vector_store and app.state.llm_services:
+         app.state.rag_service = CodeRAGService(
+             vector_store=app.state.vector_store,
+             llm_services=app.state.llm_services # Pass combined services
+         )
+         logger.info("CodeRAGService initialized.")
     else:
-        app.state.rag_service = None
-        logger.error("CodeRAGService could not be initialized due to missing dependencies (vector_store or code_refiner).")
+         logger.error("CodeRAGService could not be initialized due to missing dependencies (vector_store or llm_services).")
 
-    yield  # Application runs here
+    yield
 
     # Clean up resources if needed on shutdown
     if app.state.vector_store:
-        app.state.vector_store.save_index() # Ensure index is saved on shutdown
+        app.state.vector_store.save_index()
     logger.info(f"Shutting down {settings.APP_NAME}...")
 
 # --- API Endpoints ---
@@ -67,12 +71,21 @@ async def lifespan(app: Litestar):
 # Health check
 @get("/health", media_type=MediaType.JSON, summary="Health Check", tags=["General"])
 async def health_check(state: State) -> HealthCheckResponse:
-    ollama_status = "OK" if state.code_refiner else "Error: Ollama not initialized"
+    ollama_refiner_model = "N/A"
+    ollama_helper_model = "N/A"
+    ollama_base_url = "N/A"
+    if state.llm_services and state.llm_services.refiner_llm:
+        ollama_refiner_model = state.llm_services.refiner_model_name # Get from instance
+        ollama_base_url = state.llm_services.base_url
+    if state.llm_services and state.llm_services.helper_llm:
+         ollama_helper_model = state.llm_services.helper_model_name
     vs_status = state.vector_store.get_stats() if state.vector_store else {"status": "Error: Vector Store not initialized"}
 
     return HealthCheckResponse(
         app_name=settings.APP_NAME,
-        ollama_status=ollama_status,
+        ollama_refiner_model=ollama_refiner_model, # <<< Updated
+        ollama_helper_model=ollama_helper_model, # <<< Updated
+        ollama_base_url=ollama_base_url, # <<< Updated
         vector_store_status=vs_status
     )
 
@@ -110,12 +123,12 @@ async def query_by_task(
         response = await state.rag_service.process_task_query(
             task_description=data.task_description,
             language_hint=data.language_hint,
-            top_k_retrieval=data.top_k_retrieval,
-            score_threshold=data.score_threshold
+            top_k_retrieval=data.top_k_retrieval
         )
         return response
     except Exception as e:
         logger.error(f"Error processing task query '{data.task_description[:50]}...': {e}", exc_info=True)
+        logger.error(str(traceback.format_exc()))
         raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 # Query by similar code and optionally refine
@@ -144,7 +157,6 @@ async def query_by_similar_code(
 app = Litestar(
     route_handlers=[health_check, add_code_snippet, query_by_task, query_by_similar_code],
     lifespan=[lifespan],
-    # openapi_config could be added here for Swagger/OpenAPI docs
 )
 
 # For running with `python app/main.py` for local dev (though uvicorn is better)
